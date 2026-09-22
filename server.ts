@@ -1,10 +1,18 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import crypto from 'crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
+import {
+  securityHeadersMiddleware,
+  rateLimiterMiddleware,
+  scanResultCache,
+  validateScanInput,
+  calculateSha256,
+  generateReportId
+} from './server/security';
+import { runHeuristicAnalysis } from './server/threatEngine';
 
 dotenv.config();
 
@@ -14,6 +22,10 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
+// Apply OWASP Top 10 Security Headers
+app.use(securityHeadersMiddleware);
+
+// Body Parsers with strict size limits
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
@@ -29,7 +41,7 @@ function getGeminiClient(): GoogleGenAI | null {
       apiKey,
       httpOptions: {
         headers: {
-          'User-Agent': 'aistudio-build',
+          'User-Agent': 'aistudio-build-offerguard',
         },
       },
     });
@@ -37,340 +49,44 @@ function getGeminiClient(): GoogleGenAI | null {
   return aiClient;
 }
 
-// Fallback heuristic scanner for reliable local demo & failover
-function runHeuristicAnalysis(type: 'text' | 'url' | 'upload', content: string, fileName?: string) {
-  const lower = content.toLowerCase();
-  let score = 5;
-  const flags: Array<{
-    id: string;
-    name: string;
-    status: 'PASS' | 'WARNING' | 'CRITICAL_FAIL';
-    detail: string;
-    quoteEvidence?: string;
-  }> = [];
-
-  const risks: Array<{
-    id: string;
-    title: string;
-    severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
-    category: string;
-    description: string;
-    evidence?: string;
-  }> = [];
-
-  // Check 1: Financial Advance / Equipment / Check Cashing
-  const checkCashingTerms = ['check', 'cashier', 'deposit this check', 'wire', 'zelle', 'apple cash', 'venmo', 'bitcoin', 'crypto', 'gift card', 'hardware vendor'];
-  const matchedCheckTerms = checkCashingTerms.filter(t => lower.includes(t));
-  if (matchedCheckTerms.length >= 2) {
-    score += 45;
-    flags.push({
-      id: 'equipment-payment',
-      name: 'Advance Fee & Fake Check Traps',
-      status: 'CRITICAL_FAIL',
-      detail: 'Demands advance check deposits or fund transfers for equipment or fees.',
-      quoteEvidence: matchedCheckTerms.slice(0, 3).join(', ')
-    });
-    risks.push({
-      id: 'r-check-fraud',
-      title: 'Advance-Fee / Fake Cashier Check Laundering',
-      severity: 'CRITICAL',
-      category: 'Financial Trap',
-      description: 'The sender requests depositing an employer check and transferring funds to a third-party vendor. The initial check will bounce days later, leaving the victim liable for the entire lost balance.',
-      evidence: 'Referenced check deposit / wire transfer instructions.'
-    });
-  } else {
-    flags.push({
-      id: 'equipment-payment',
-      name: 'Advance Fee & Fake Check Traps',
-      status: 'PASS',
-      detail: 'No upfront check cashing or equipment procurement payments requested.'
-    });
-  }
-
-  // Check 2: Off-platform / Unofficial Messaging (Telegram, WhatsApp, Signal)
-  const chatTerms = ['telegram', 'whatsapp', 'signal', 'hangouts', 'google chat', 'skype'];
-  const matchedChat = chatTerms.filter(t => lower.includes(t));
-  if (matchedChat.length > 0) {
-    score += 25;
-    flags.push({
-      id: 'comm-channel',
-      name: 'Unofficial Communication Channels',
-      status: 'CRITICAL_FAIL',
-      detail: `Conducting interviews or onboarding via informal messaging channels (${matchedChat.join(', ')}).`,
-      quoteEvidence: matchedChat.join(', ')
-    });
-    risks.push({
-      id: 'r-informal-chat',
-      title: 'Untraceable Off-Platform Interview',
-      severity: 'HIGH',
-      category: 'Deceptive Tactics',
-      description: 'Legitimate employers conduct formal interviews via verified video tools (Google Meet, Zoom, Teams) or official applicant portals, not anonymous messaging platforms.',
-      evidence: matchedChat[0]
-    });
-  } else {
-    flags.push({
-      id: 'comm-channel',
-      name: 'Unofficial Communication Channels',
-      status: 'PASS',
-      detail: 'No suspicious off-platform messaging applications detected.'
-    });
-  }
-
-  // Check 3: Free Email Provider for Corporate Representation
-  const freeEmail = lower.includes('@gmail.com') || lower.includes('@yahoo.com') || lower.includes('@hotmail.com') || lower.includes('@outlook.com');
-  const claimsCorporate = lower.includes('recruiting') || lower.includes('director') || lower.includes('hr') || lower.includes('operations') || lower.includes('corp') || lower.includes('llc') || lower.includes('inc');
-  if (freeEmail && claimsCorporate) {
-    score += 20;
-    flags.push({
-      id: 'sender-domain',
-      name: 'Sender Domain Authenticity',
-      status: 'WARNING',
-      detail: 'Sender uses a public free email domain (Gmail/Yahoo/Outlook) rather than an authenticated corporate domain.'
-    });
-    risks.push({
-      id: 'r-free-webmail',
-      title: 'Sender Domain Discrepancy',
-      severity: 'HIGH',
-      category: 'Domain Impersonation',
-      description: 'Formal corporate job offers originate from verified enterprise domains, not personal webmail accounts.'
-    });
-  } else {
-    flags.push({
-      id: 'sender-domain',
-      name: 'Sender Domain Authenticity',
-      status: 'PASS',
-      detail: 'Sender domain does not exhibit generic webmail impersonation flags.'
-    });
-  }
-
-  // Check 4: Rental Deposit Traps (Overseas landlord, wire before walkthrough)
-  const rentalSigns = ['condo', 'apartment', 'rent', 'lease', 'tenant', 'deposit', 'keys', 'fedex', 'missionary', 'relocated', 'walkthrough'];
-  const matchedRental = rentalSigns.filter(t => lower.includes(t));
-  const isRental = matchedRental.length >= 3;
-  if (isRental && (lower.includes('wire') || lower.includes('zelle') || lower.includes('apple cash') || lower.includes('fedex') || lower.includes('keys'))) {
-    score += 40;
-    flags.push({
-      id: 'rental-deposit',
-      name: 'Unseen Property Deposit Trap',
-      status: 'CRITICAL_FAIL',
-      detail: 'Demands security deposit or rent payment prior to in-person lease signing or physical walkthrough.'
-    });
-    risks.push({
-      id: 'r-phantom-rental',
-      title: 'Phantom Rental Deposit Theft',
-      severity: 'CRITICAL',
-      category: 'Financial Trap',
-      description: 'The alleged owner claims inability to show the unit due to being abroad or out of town, promising to mail keys once a deposit is wired. The property is often not theirs to lease.',
-      evidence: 'Keys delivered via courier upon wire receipt.'
-    });
-  }
-
-  // Check 5: High-pressure urgency & premature PII demand
-  if (lower.includes('ssn') || lower.includes('social security') || lower.includes('routing number') || lower.includes('within 12 hours') || lower.includes('within 24 hours') || lower.includes('urgent')) {
-    score += 15;
-    flags.push({
-      id: 'urgency-pii',
-      name: 'Premature PII & Artificial Urgency',
-      status: 'WARNING',
-      detail: 'High pressure deadline and sensitive SSN or banking credentials requested prior to formal vetting.'
-    });
-    risks.push({
-      id: 'r-pii-harvest',
-      title: 'Premature Identity Harvesting',
-      severity: 'MEDIUM',
-      category: 'Identity Theft',
-      description: 'Candidate is coerced with a tight countdown to surrender government identifiers and direct deposit details.'
-    });
-  } else {
-    flags.push({
-      id: 'urgency-pii',
-      name: 'Premature PII & Artificial Urgency',
-      status: 'PASS',
-      detail: 'Standard timeline without aggressive coercion observed.'
-    });
-  }
-
-  // URL checks if input is URL
-  let domain = 'text-analysis';
-  let spoofedEntity = 'None detected';
-  let domainRiskLevel: 'LOW' | 'MODERATE' | 'HIGH' | 'CRITICAL' = 'LOW';
-  let domainAgeRisk = 'Standard corporate domain or text input.';
-
-  if (type === 'url') {
-    try {
-      const parsedUrl = new URL(content.startsWith('http') ? content : `https://${content}`);
-      domain = parsedUrl.hostname;
-      const tld = domain.split('.').pop() || '';
-      const suspiciousTlds = ['xyz', 'top', 'live', 'club', 'work', 'click', 'link', 'zip', 'monster'];
-      const hasHyphen = domain.includes('-') && (domain.includes('portal') || domain.includes('career') || domain.includes('apply') || domain.includes('jobs') || domain.includes('hr'));
-      
-      if (suspiciousTlds.includes(tld) || hasHyphen) {
-        score += 35;
-        domainRiskLevel = 'HIGH';
-        domainAgeRisk = `Newly registered or low-reputation top-level domain (.${tld}) with keyword combination typical of phishing lookalike sites.`;
-        
-        // Check if spoofing common brand
-        const brands = ['stripe', 'google', 'amazon', 'apple', 'microsoft', 'meta', 'netflix'];
-        const matchedBrand = brands.find(b => domain.toLowerCase().includes(b));
-        if (matchedBrand) {
-          spoofedEntity = `Impersonating ${matchedBrand.charAt(0).toUpperCase() + matchedBrand.slice(1)}`;
-          score += 25;
-          domainRiskLevel = 'CRITICAL';
-        }
-
-        risks.push({
-          id: 'r-domain-spoof',
-          title: 'Lookalike Phishing Domain',
-          severity: 'HIGH',
-          category: 'Domain Impersonation',
-          description: `The URL domain (${domain}) utilizes defensive keyword bundling and alternative TLDs to mimic legitimate corporate job portals.`,
-          evidence: domain
-        });
-      }
-    } catch {
-      domain = 'invalid-url-format';
-      domainRiskLevel = 'MODERATE';
-      domainAgeRisk = 'Malformed or non-standard URL structure.';
-    }
-  }
-
-  score = Math.min(Math.max(score, 4), 98);
-  let threatLevel: 'SAFE' | 'LOW_RISK' | 'SUSPICIOUS' | 'HIGH_THREAT' | 'CRITICAL_SCAM' = 'LOW_RISK';
-  if (score >= 80) threatLevel = 'CRITICAL_SCAM';
-  else if (score >= 55) threatLevel = 'HIGH_THREAT';
-  else if (score >= 30) threatLevel = 'SUSPICIOUS';
-  else if (score >= 15) threatLevel = 'LOW_RISK';
-  else threatLevel = 'SAFE';
-
-  let targetCategory: 'Job Offer Scam' | 'Rental / Deposit Scam' | 'Phishing Communication' | 'Legitimate Offer' | 'Unverified Offer' = 'Job Offer Scam';
-  if (isRental) targetCategory = 'Rental / Deposit Scam';
-  else if (type === 'url') targetCategory = 'Phishing Communication';
-  else if (threatLevel === 'SAFE') targetCategory = 'Legitimate Offer';
-
-  let verdictSummary = '';
-  if (threatLevel === 'CRITICAL_SCAM') {
-    verdictSummary = isRental 
-      ? 'Critical rental deposit trap detected: demands advance funds via wire or cash apps prior to physical access.'
-      : 'Critical scam indicators detected: classic fake check procurement and advance-fee equipment scheme.';
-  } else if (threatLevel === 'HIGH_THREAT') {
-    verdictSummary = 'High threat risk: communication exhibits deceptive domain spoofing, off-platform interviews, or premature sensitive data collection.';
-  } else if (threatLevel === 'SUSPICIOUS') {
-    verdictSummary = 'Suspicious elements detected: verify sender identity and avoid transferring any money or providing banking credentials.';
-  } else {
-    verdictSummary = 'Low risk profile: this communication reflects standard hiring practices with no advance financial traps.';
-  }
-
-  const sha256 = crypto.createHash('sha256').update(content || 'empty_scan').digest('hex');
-  const reportId = `OG-2026-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-
-  const highlights = risks.slice(0, 3).map(r => ({
-    text: r.evidence || r.title,
-    reason: r.description,
-    severity: (r.severity === 'CRITICAL' ? 'CRITICAL' : r.severity === 'HIGH' ? 'HIGH' : 'MEDIUM') as 'CRITICAL' | 'HIGH' | 'MEDIUM'
-  }));
-  if (highlights.length === 0) {
-    highlights.push({
-      text: content.slice(0, 80),
-      reason: 'Standard terms evaluated against employment threat heuristics.',
-      severity: 'MEDIUM'
-    });
-  }
-
-  const safeReply = threatLevel === 'SAFE' ? {
-    recipientTitle: 'Hiring Team / Talent Acquisition',
-    subject: 'Offer Letter Confirmation & Onboarding Steps',
-    body: 'Dear Hiring Team,\n\nThank you for extending this offer. I have reviewed the terms and look forward to completing formal onboarding. Please confirm our first check-in time and verify the direct internal contact for our department.\n\nBest regards,\nCandidate',
-    strategyRationale: 'Standard professional acknowledgement for legitimate employment communications.'
-  } : {
-    recipientTitle: 'Alleged Recruiter / Sender',
-    subject: 'Verification Request: Employee Requisition & Official Portal Link',
-    body: 'Hello,\n\nThank you for reaching out regarding this opportunity. As a security precaution, I do not accept mailed checks or transfer funds to third-party equipment vendors. Please provide:\n\n1. The official job requisition link on your company\'s verified careers portal (e.g. company.com/careers).\n2. Your corporate email address and direct phone extension matching the official domain.\n3. The name and email of your verified HR Operations Director for cross-reference.\n\nOnce verified through official channels, I will gladly proceed.',
-    strategyRationale: 'Firmly enforces security boundaries without disclosing banking info or confrontation; fraudulent actors will immediately break contact.'
-  };
-
-  return {
-    scamThreatIndex: score,
-    threatLevel,
-    verdictSummary,
-    targetCategory,
-    domainAnalysis: {
-      domain,
-      riskLevel: domainRiskLevel,
-      isFreeOrSuspiciousEmail: freeEmail,
-      domainAgeRiskAssessment: domainAgeRisk,
-      spoofedEntity
-    },
-    redFlagChecks: flags,
-    identifiedRisks: risks.length > 0 ? risks : [
-      {
-        id: 'r-verified-standard',
-        title: 'Standard Employment Terms',
-        severity: 'LOW',
-        category: 'Baseline Check',
-        description: 'Standard compensation and onboarding workflow with no equipment purchase or money transfer demands.'
-      }
-    ],
-    highlights,
-    safeReply,
-    auditFingerprint: {
-      reportId,
-      sha256Fingerprint: sha256,
-      timestamp: new Date().toISOString(),
-      nodeSigner: 'OfferGuard-ForensicEngine-v2.4'
-    },
-    safetyRecommendations: [
-      'Never deposit checks sent by an employer to buy hardware from an external vendor.',
-      'Verify recruiter identities via the official corporate website careers page or verified LinkedIn profile.',
-      'Never wire funds, send Zelle, or purchase gift cards for job equipment or rental reservations.',
-      'Conduct all communication through corporate email domains (@company.com), never Telegram or personal webmail.'
-    ],
-    nextSteps: [
-      'Report suspicious job postings to the Federal Trade Commission at ReportFraud.ftc.gov.',
-      'Forward phishing emails to the FBI Internet Crime Complaint Center (IC3) at ic3.gov.',
-      'Report domain abuse directly to the registrar and hosting provider.'
-    ],
-    analyzedAt: new Date().toISOString(),
-    inputType: type,
-    sourcePreview: content.slice(0, 160) + (content.length > 160 ? '...' : ''),
-    fullSourceText: content,
-    isFallbackEngine: true
-  };
-}
-
-// API Routes
+// Health & Readiness Endpoint
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
-    service: 'OfferGuard API',
+    service: 'OfferGuard Threat Inspection API',
+    version: '1.0.0',
     geminiConfigured: !!getGeminiClient(),
+    cacheEntries: scanResultCache.size(),
+    timestamp: new Date().toISOString()
   });
 });
 
-app.post('/api/scan', async (req: Request, res: Response) => {
-  const { type, content, file } = req.body;
-
-  const inputType: 'text' | 'url' | 'upload' = type === 'upload' ? 'upload' : type === 'url' ? 'url' : 'text';
-  const trimmed = typeof content === 'string' ? content.trim() : '';
-
-  if (inputType !== 'upload' && trimmed.length === 0) {
-    res.status(400).json({ error: 'Content is required for threat scanning.' });
+// Threat Scan Endpoint with Rate Limiting and Caching
+app.post('/api/scan', rateLimiterMiddleware, async (req: Request, res: Response) => {
+  const validation = validateScanInput(req.body);
+  if (!validation.valid || !validation.data) {
+    res.status(400).json({ error: validation.error || 'Invalid scan payload.' });
     return;
   }
 
-  if (inputType === 'upload' && (!file || !file.base64)) {
-    res.status(400).json({ error: 'Uploaded file data is required.' });
+  const { type, content, file } = validation.data;
+  const rawFingerprintData = type === 'upload'
+    ? (file?.base64?.slice(0, 5000) || file?.name || '')
+    : content;
+
+  // Cache Check: sub-millisecond retrieval on identical repeat checks
+  const cacheKey = `${type}:${calculateSha256(rawFingerprintData)}`;
+  const cachedResult = scanResultCache.get(cacheKey);
+  if (cachedResult) {
+    res.setHeader('X-Cache', 'HIT');
+    res.json(cachedResult);
     return;
   }
 
-  const ai = getGeminiClient();
-  const sourcePreview = inputType === 'upload'
-    ? `Uploaded Document: ${file?.name || 'document'} (${Math.round((file?.size || 0) / 1024)} KB)`
-    : trimmed.slice(0, 160) + (trimmed.length > 160 ? '...' : '');
+  res.setHeader('X-Cache', 'MISS');
 
-  // Calculate cryptographic sha256 fingerprint
-  const rawFingerprintData = inputType === 'upload' ? (file?.base64?.slice(0, 5000) || file?.name || '') : trimmed;
-  const sha256 = crypto.createHash('sha256').update(rawFingerprintData).digest('hex');
-  const reportId = `OG-2026-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+  const sha256 = calculateSha256(rawFingerprintData);
+  const reportId = generateReportId();
   const auditFingerprint = {
     reportId,
     sha256Fingerprint: sha256,
@@ -378,13 +94,19 @@ app.post('/api/scan', async (req: Request, res: Response) => {
     nodeSigner: 'OfferGuard-ForensicEngine-v2.4'
   };
 
-  // If Gemini is available, run deep security inspection
+  const sourcePreview = type === 'upload'
+    ? `Uploaded Document: ${file?.name || 'document'} (${Math.round((file?.size || 0) / 1024)} KB)`
+    : content.slice(0, 160) + (content.length > 160 ? '...' : '');
+
+  const ai = getGeminiClient();
+
+  // If Gemini is available, run deep forensic LLM inspection
   if (ai) {
     try {
-      const prompt = `Analyze this ${inputType === 'url' ? 'job/rental URL' : inputType === 'upload' ? 'uploaded job offer document / appointment letter / rental agreement' : 'job offer letter / recruiter communication'} for scam indicators, advance-fee equipment check scams, rental deposit traps, lookalike domain spoofing, domain age risks, and social engineering manipulation:
+      const prompt = `Analyze this ${type === 'url' ? 'job/rental URL' : type === 'upload' ? 'uploaded job offer document / appointment letter / rental agreement' : 'job offer letter / recruiter communication'} for scam indicators, advance-fee equipment check scams, rental deposit traps, lookalike domain spoofing, domain age risks, and social engineering manipulation:
 
-${inputType === 'upload' ? `DOCUMENT FILENAME: ${file?.name || 'unknown'}` : ''}
-${trimmed ? `EXTRACTED TEXT:\n"""\n${trimmed.slice(0, 8000)}\n"""` : ''}
+${type === 'upload' ? `DOCUMENT FILENAME: ${file?.name || 'unknown'}` : ''}
+${content ? `EXTRACTED TEXT:\n"""\n${content.slice(0, 8000)}\n"""` : ''}
 
 Evaluate with high cybersecurity precision:
 1. SCAM THREAT INDEX: 0 (completely legitimate) to 100 (irrefutable scam/fraud).
@@ -412,8 +134,8 @@ Evaluate with high cybersecurity precision:
 
       console.log('Sending inspection request to Gemini 3.8 Flash...');
 
-      let contentsPayload: any;
-      if (inputType === 'upload' && file?.base64) {
+      let contentsPayload: unknown;
+      if (type === 'upload' && file?.base64) {
         const cleanBase64 = file.base64.replace(/^data:[^;]+;base64,/, '');
         const validMime = file.mimeType && (file.mimeType.startsWith('image/') || file.mimeType === 'application/pdf')
           ? file.mimeType
@@ -436,35 +158,27 @@ Evaluate with high cybersecurity precision:
 
       const geminiPromise = ai.models.generateContent({
         model: 'gemini-3.8-flash',
-        contents: contentsPayload,
+        contents: contentsPayload as any,
         config: {
-          systemInstruction: 'You are OfferGuard, a senior cybersecurity analyst and digital fraud investigator specializing in employment phishing, fake check advance-fee scams, and apartment rental deposit traps. You evaluate job offer letters, recruiter emails, and vacancy URLs with rigorous skepticism, flagging subtle indicators such as Telegram interviews, certified check equipment scams, generic webmail senders, and premature SSN/banking demands.',
-          temperature: 0.2,
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              scamThreatIndex: {
-                type: Type.INTEGER,
-                description: '0 to 100 scam risk index. 0-25 Safe, 26-55 Suspicious, 56-80 High Threat, 81-100 Critical Scam.'
-              },
+              scamThreatIndex: { type: Type.INTEGER, description: 'Threat score from 0 (safe) to 100 (critical scam)' },
               threatLevel: {
                 type: Type.STRING,
-                description: 'SAFE, LOW_RISK, SUSPICIOUS, HIGH_THREAT, or CRITICAL_SCAM'
+                enum: ['SAFE', 'LOW_RISK', 'SUSPICIOUS', 'HIGH_THREAT', 'CRITICAL_SCAM']
               },
-              verdictSummary: {
-                type: Type.STRING,
-                description: 'Direct executive verdict explaining primary finding'
-              },
+              verdictSummary: { type: Type.STRING },
               targetCategory: {
                 type: Type.STRING,
-                description: 'Job Offer Scam, Rental / Deposit Scam, Phishing Communication, or Legitimate Offer'
+                enum: ['Job Offer Scam', 'Rental / Deposit Scam', 'Phishing Communication', 'Legitimate Offer', 'Unverified Offer']
               },
               domainAnalysis: {
                 type: Type.OBJECT,
                 properties: {
                   domain: { type: Type.STRING },
-                  riskLevel: { type: Type.STRING },
+                  riskLevel: { type: Type.STRING, enum: ['LOW', 'MODERATE', 'HIGH', 'CRITICAL'] },
                   isFreeOrSuspiciousEmail: { type: Type.BOOLEAN },
                   domainAgeRiskAssessment: { type: Type.STRING },
                   spoofedEntity: { type: Type.STRING }
@@ -478,7 +192,7 @@ Evaluate with high cybersecurity precision:
                   properties: {
                     id: { type: Type.STRING },
                     name: { type: Type.STRING },
-                    status: { type: Type.STRING },
+                    status: { type: Type.STRING, enum: ['PASS', 'WARNING', 'CRITICAL_FAIL'] },
                     detail: { type: Type.STRING },
                     quoteEvidence: { type: Type.STRING }
                   },
@@ -492,7 +206,7 @@ Evaluate with high cybersecurity precision:
                   properties: {
                     id: { type: Type.STRING },
                     title: { type: Type.STRING },
-                    severity: { type: Type.STRING },
+                    severity: { type: Type.STRING, enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] },
                     category: { type: Type.STRING },
                     description: { type: Type.STRING },
                     evidence: { type: Type.STRING }
@@ -507,7 +221,7 @@ Evaluate with high cybersecurity precision:
                   properties: {
                     text: { type: Type.STRING },
                     reason: { type: Type.STRING },
-                    severity: { type: Type.STRING }
+                    severity: { type: Type.STRING, enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] }
                   },
                   required: ['text', 'reason', 'severity']
                 }
@@ -561,12 +275,16 @@ Evaluate with high cybersecurity precision:
           scamThreatIndex: Math.min(Math.max(Number(parsed.scamThreatIndex) || 0, 0), 100),
           auditFingerprint,
           analyzedAt: new Date().toISOString(),
-          inputType,
+          inputType: type,
           sourcePreview,
-          fullSourceText: trimmed || file?.name || '',
+          fullSourceText: content || file?.name || '',
           uploadedFileName: file?.name,
           isFallbackEngine: false
         };
+
+        // Cache successful inspection result
+        scanResultCache.set(cacheKey, result);
+
         res.json(result);
         return;
       }
@@ -576,14 +294,19 @@ Evaluate with high cybersecurity precision:
   }
 
   // Fallback heuristic engine
-  const fallbackResult = runHeuristicAnalysis(inputType, trimmed || file?.name || 'Uploaded document', file?.name);
-  res.json({
+  const fallbackResult = runHeuristicAnalysis(type, content || file?.name || 'Uploaded document', file?.name);
+  const finalResult = {
     ...fallbackResult,
     auditFingerprint,
     sourcePreview,
-    fullSourceText: trimmed || file?.name,
+    fullSourceText: content || file?.name,
     uploadedFileName: file?.name
-  });
+  };
+
+  // Cache fallback result for performance
+  scanResultCache.set(cacheKey, finalResult);
+
+  res.json(finalResult);
 });
 
 // Start server with Vite middleware in dev or static files in prod

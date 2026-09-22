@@ -122,10 +122,18 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-[#fafaf9] text-stone-900 flex flex-col font-sans selection:bg-stone-200">
+      {/* Skip to Main Content Link for Screen Readers & Keyboard Nav */}
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:px-4 focus:py-2 focus:bg-stone-900 focus:text-white focus:rounded-lg focus:shadow-lg focus:text-xs focus:font-bold"
+      >
+        Skip to main content
+      </a>
+
       {/* Sticky Header with Navigation Switcher */}
       <Header currentView={view} onNavigate={setView} />
 
-      <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
+      <main id="main-content" tabIndex={-1} className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8 focus:outline-hidden">
         <AnimatePresence mode="wait">
           {view === 'landing' ? (
             <motion.div
@@ -314,10 +322,10 @@ export function App() {
         <div className="max-w-5xl mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-center sm:text-left">
           <div>
             <span className="font-bold text-stone-900">OfferGuard</span> — Built by{' '}
-            <strong className="text-stone-900">Sumit Mishra</strong>.
+            <strong className="text-stone-900">Sumit Kumar Mishra</strong>.
           </div>
           <div className="text-[11px] text-stone-400">
-            Automated security threat analysis.
+            PromptWars × GEN AI Club · Fake Offer Letter & Phishing Inspector
           </div>
         </div>
       </footer>

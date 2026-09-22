@@ -1,7 +1,25 @@
 {
-  "name": "react-example",
+  "name": "offerguard",
+  "version": "1.0.0",
+  "description": "Multi-Modal Fake Offer Letter & Phishing Inspector powered by Gemini 3.8 Flash for PromptWars × GEN AI Club on Hack2skill",
+  "author": "Sumit Kumar Mishra <sumitmishraa.business@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sumitmishraa/offerguard.git"
+  },
+  "keywords": [
+    "cybersecurity",
+    "phishing-detector",
+    "fake-offer-letter",
+    "gemini-ai",
+    "scam-inspector",
+    "promptwars",
+    "hack2skill",
+    "threat-analysis",
+    "genai"
+  ],
   "private": true,
-  "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -9,7 +27,9 @@
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test tests/**/*.test.ts",
+    "test:coverage": "tsx --test --experimental-test-coverage tests/**/*.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -139,6 +139,11 @@ export function ThreatIndexMeter({
         <div className="h-2.5 w-full bg-stone-100 rounded-full overflow-hidden border border-stone-200/80 p-0.5">
           <div
             id="threat-index-bar"
+            role="progressbar"
+            aria-valuenow={score}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={`Scam Threat Index: ${score} percent`}
             style={{ width: `${Math.max(score, 4)}%` }}
             className={`h-full rounded-full transition-all duration-500 ${config.barColor}`}
           />
