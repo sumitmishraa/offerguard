@@ -1,0 +1,6 @@
+{
+  "name": "OfferGuard: Fake Offer Letter & Phishing Inspector",
+  "description": "For job seekers and renters, OfferGuard turns suspicious job offer texts and URLs into a dynamic Scam Threat Index (0-100%) using Gemini AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
