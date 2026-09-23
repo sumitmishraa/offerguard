@@ -1,6 +1,5 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
@@ -15,9 +14,6 @@ import {
 import { runHeuristicAnalysis } from './server/threatEngine';
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
@@ -318,7 +314,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(__dirname, 'dist');
+    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, 'index.html'));
@@ -330,4 +326,9 @@ async function startServer() {
   });
 }
 
-startServer();
+// Only launch standalone listener when not in Vercel serverless environment
+if (process.env.VERCEL !== '1') {
+  startServer();
+}
+
+export default app;
