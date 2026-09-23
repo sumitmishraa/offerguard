@@ -2,7 +2,6 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
-import { createServer as createViteServer } from 'vite';
 import {
   securityHeadersMiddleware,
   rateLimiterMiddleware,
@@ -152,8 +151,9 @@ Evaluate with high cybersecurity precision:
         contentsPayload = prompt;
       }
 
+      const modelName = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
       const geminiPromise = ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: modelName,
         contents: contentsPayload as any,
         config: {
           responseMimeType: 'application/json',
@@ -308,6 +308,7 @@ Evaluate with high cybersecurity precision:
 // Start server with Vite middleware in dev or static files in prod
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
